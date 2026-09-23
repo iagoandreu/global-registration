@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "b91d7e42-08a5-4c37-bd60-1f4a9e35c072",
+    "author": "Iago Andreu",
+    "description": {
+        "": "Align one body onto another by shape alone, carrying any number of entities with it."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
