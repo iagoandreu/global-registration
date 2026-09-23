@@ -86,11 +86,47 @@ slide. Point-to-plane only penalises motion along the surface normal.
 
 ## Move along
 
-Anything selected there gets the same transform: bodies, mesh bodies, surfaces,
-or whole components. Bodies go through **one** move feature, not one each — separate
-features would put separate entries in the timeline, and rolling back one of them
-would take the assembly apart. Occurrences are composed onto their own placement
-instead, because for an occurrence the placement *is* the transform.
+Anything selected there gets the same transform: solids, mesh bodies, surfaces,
+sketches, construction geometry, or whole components. Fixed and moving accept
+mesh, solid and surface too, in any combination — a mesh may be the fixed entity
+and a solid the moving one, since everything is read as triangles.
+
+**The collection may not be mixed, and Fusion will not tell you.** Measured here:
+a mesh body and a B-Rep body in one `ObjectCollection` moves the mesh and leaves
+the solid exactly where it was, with `defineAsFreeMove` and `moveFeatures.add`
+both reporting success and no exception raised. That is how a plate stayed behind
+while two bones aligned. The documentation only says B-Rep bodies and faces may
+not be mixed; it does not mention meshes at all. So there is **one move feature
+per kind**, not one for everything.
+
+**A B-Rep body inside a BaseFeature is a second case.** Moved plainly it raises
+*"Some input argument is invalid"* and does not move; it works only with
+`targetBaseFeature` set and the base feature's edit reopened. This matters
+because bodies produced by Mesh to Part live in base features.
+
+**Construction geometry cannot be moved at all** in a parametric design — the move
+feature refuses it with *"Environment is not supported"*. That is not a bug to
+work around: construction geometry is defined by what it references and follows
+that. It is reported per entity rather than silently skipped. To carry it along,
+put it in a component and move the occurrence.
+
+Occurrences are composed onto their own placement, because for an occurrence the
+placement *is* the transform.
+
+## Nothing is reported as moved until it has been measured
+
+Every entity is checked after the move: where it actually ended up against where
+the matrix says it should be, printed per entity with the error in millimetres.
+
+That check is not decoration — it is the only reason the mixed-collection bug was
+found rather than shipped, and getting it right took two attempts of its own. The
+probe point must be **exact**, so a bounding-box centre is out: the box is
+axis-aligned, so a rotation moves its centre somewhere else entirely and the check
+would call a healthy move a failure. And it must be **live**: the first version
+read the display mesh, which is cached, and after a move feature it handed back
+the old centroid and reported a plate that had moved perfectly as *"DID NOT MOVE
+by 1311 mm"*. A solid's centre of mass and a mesh body's own node list are both
+real geometry, and both are recomputed.
 
 ## The transform is checked before anything moves
 
@@ -159,6 +195,12 @@ py -3.10 tools/gr.py register '{"fixed": "Bone CT", "moving": "Bone scan", "alon
 
 runs it inside a live Fusion through the dev bridge. Off by default — create a
 `devbridge.on` file next to the installed add-in.
+
+`tools/gr.py verify_apply` is the regression test for the part that offline tests
+cannot reach: it drives the real `apply_transform` over a mesh body, an ordinary
+solid and a base-feature solid **at once**, with a transform that rotates as well
+as translates, and checks all three landed exactly. Everything it builds is
+scratch and is deleted afterwards.
 
 ## Licence
 

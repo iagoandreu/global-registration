@@ -282,39 +282,211 @@ def matrix_from(rows):
 # applying it
 # --------------------------------------------------------------------------- #
 
-def apply_transform(design, entities, matrix):
-    """Move every entity by one matrix, as ONE feature where the API allows it.
+def probe_point(e):
+    """A point on the entity that a rigid transform moves EXACTLY, read LIVE.
 
-    Occurrences are not moved by a move feature - their placement IS their
-    transform - so they are composed directly and kept out of the collection.
+    Two requirements, and the first version met only one of them.
+
+    Exact: the point has to be affine-covariant, so a bounding box centre is out.
+    The box is axis-aligned, so a rotation moves its centre somewhere else
+    entirely and a check built on it calls a healthy move a failure.
+
+    Live: it has to come from the body's own geometry, not from a rendering.
+    The first version read the display mesh, which is cached - after a move
+    feature it handed back the OLD centroid and the check reported a plate that
+    had moved perfectly as "DID NOT MOVE by 1311 mm". A solid's centre of mass
+    and a mesh body's own node list are both real geometry and are recomputed.
     """
-    comp = design.rootComponent
-    occs = []
-    movable = adsk.core.ObjectCollection.create()
-    for e in entities:
-        occ = adsk.fusion.Occurrence.cast(e)
-        if occ:
-            occs.append(occ)
+    mb = adsk.fusion.MeshBody.cast(e)
+    if mb:
+        try:
+            pm = mb.mesh or mb.displayMesh
+            co = pm.nodeCoordinatesAsDouble
+            n = len(co) // 3
+            return (sum(co[0::3]) / n, sum(co[1::3]) / n, sum(co[2::3]) / n)
+        except Exception:
+            pass
+    body = adsk.fusion.BRepBody.cast(e)
+    if body:
+        try:
+            if body.isSolid:
+                c = body.physicalProperties.centerOfMass
+                if c:
+                    return (c.x, c.y, c.z)
+        except Exception:
+            pass
+        try:                            # a surface body has no mass; use its mesh
+            co, _i = body_mesh(body)
+            n = len(co) // 3
+            return (sum(co[0::3]) / n, sum(co[1::3]) / n, sum(co[2::3]) / n)
+        except Exception:
+            pass
+    for attr in ('geometry', 'worldGeometry'):
+        g = getattr(e, attr, None)
+        if g is None:
             continue
-        movable.add(e)
+        o = getattr(g, 'origin', None)
+        if o is not None:
+            return (o.x, o.y, o.z)
+        if hasattr(g, 'x'):
+            return (g.x, g.y, g.z)
+    occ = adsk.fusion.Occurrence.cast(e)
+    if occ:
+        t = occ.transform2.translation
+        return (t.x, t.y, t.z)
+    return None
 
-    made = []
-    if movable.count:
-        mi = comp.features.moveFeatures.createInput2(movable)
-        if not mi.defineAsFreeMove(matrix):
-            raise RuntimeError('Fusion refused defineAsFreeMove for those bodies')
-        feat = comp.features.moveFeatures.add(mi)
-        made.append('move feature over %d entit%s'
-                    % (movable.count, 'y' if movable.count == 1 else 'ies'))
-        if feat is None:
-            made[-1] += ' (direct design: no timeline entry)'
+
+def refetch(design, e, token, name):
+    """The same entity after a feature has rebuilt it.
+
+    A move feature in a parametric design replaces the body, so the reference
+    held before it is stale. The token usually survives; when it does not, the
+    name does, and measuring the wrong object is worse than measuring a
+    namesake - so the name search is restricted to the same component.
+    """
+    if token:
+        try:
+            found = design.findEntityByToken(token)
+            if found and len(found):
+                return found[0]
+        except Exception:
+            pass
+    try:
+        comp = e.parentComponent
+        for coll in (comp.bRepBodies, comp.meshBodies):
+            for cand in coll:
+                if cand.name == name:
+                    return cand
+    except Exception:
+        pass
+    return e
+
+
+def _kind(e):
+    if adsk.fusion.MeshBody.cast(e):
+        return 'mesh'
+    if adsk.fusion.BRepBody.cast(e):
+        return 'brep'
+    if adsk.fusion.Occurrence.cast(e):
+        return 'occurrence'
+    return 'other'
+
+
+def apply_transform(design, entities, matrix):
+    """Move everything by one matrix, in as few features as the API allows.
+
+    THE COLLECTION MAY NOT BE MIXED. Measured in this Fusion: a mesh body and a
+    B-Rep body in one ObjectCollection moves the mesh 50 mm, leaves the solid
+    exactly where it was, and reports success from BOTH defineAsFreeMove and
+    moveFeatures.add. No exception, no warning. That is how a plate stayed behind
+    while the two bones aligned. The documentation only says B-Rep bodies and
+    faces may not be mixed; it does not mention meshes at all.
+
+    A B-REP BODY INSIDE A BASEFEATURE IS A SEPARATE CASE. Moved plainly it raises
+    "Some input argument is invalid" and does not move. It works only with
+    targetBaseFeature set and the base feature's edit reopened - which matters
+    here because bodies produced by Mesh to Part live in base features.
+
+    CONSTRUCTION GEOMETRY CANNOT BE MOVED AT ALL in a parametric design: the move
+    feature refuses it with "Environment is not supported". It is not a bug to
+    work around - construction geometry is defined by what it references, so it
+    follows when those move. It is reported rather than silently skipped.
+
+    So: one feature per (component, kind, owning base feature), occurrences
+    composed onto their own placement, and every entity checked afterwards.
+    """
+    groups = {}
+    occs = []
+    order = []
+    for e in entities:
+        k = _kind(e)
+        if k == 'occurrence':
+            occs.append(e)
+            continue
+        base = None
+        if k == 'brep':
+            try:
+                base = e.baseFeature
+            except Exception:
+                base = None
+        comp = getattr(e, 'parentComponent', None) or design.rootComponent
+        key = (comp.entityToken if hasattr(comp, 'entityToken') else id(comp),
+               k, base.entityToken if base else None)
+        if key not in groups:
+            groups[key] = {'comp': comp, 'kind': k, 'base': base, 'ents': []}
+            order.append(key)
+        groups[key]['ents'].append(e)
+
+    tokens = {}
+    names = {}
+    for e in entities:
+        try:
+            tokens[id(e)] = e.entityToken
+        except Exception:
+            tokens[id(e)] = None
+        names[id(e)] = entity_label(e)
+    before = {id(e): probe_point(e) for e in entities}
+    notes = []
+
+    for key in order:
+        g = groups[key]
+        col = adsk.core.ObjectCollection.create()
+        for e in g['ents']:
+            col.add(e)
+        label = '%d %s' % (len(g['ents']), g['kind'])
+        try:
+            mi = g['comp'].features.moveFeatures.createInput2(col)
+            base = g['base']
+            if base is not None:
+                mi.targetBaseFeature = base
+                base.startEdit()
+            try:
+                if not mi.defineAsFreeMove(matrix):
+                    raise RuntimeError('defineAsFreeMove refused the matrix')
+                g['comp'].features.moveFeatures.add(mi)
+            finally:
+                if base is not None:
+                    base.finishEdit()
+            notes.append('move feature over %s%s'
+                         % (label, ' (inside a base feature)' if base else ''))
+        except Exception:
+            notes.append('%s could NOT be moved: %s'
+                         % (label, short_error(traceback.format_exc())))
 
     for occ in occs:
-        t = occ.transform2
-        t.transformBy(matrix)
-        occ.transform2 = t
-        made.append('occurrence "%s" transform composed' % occ.name)
-    return made
+        try:
+            t = occ.transform2
+            t.transformBy(matrix)
+            occ.transform2 = t
+            notes.append('occurrence "%s" transform composed' % occ.name)
+        except Exception:
+            notes.append('occurrence "%s" could NOT be moved: %s'
+                         % (occ.name, short_error(traceback.format_exc())))
+
+    adsk.doEvents()
+
+    # ---- did each of them actually move, and to the right place? --------- #
+    checks = []
+    for e in entities:
+        b = before.get(id(e))
+        cur = refetch(design, e, tokens.get(id(e)), names.get(id(e)))
+        a = probe_point(cur)
+        row = {'entity': entity_label(cur), 'kind': _kind(cur)}
+        if b is None or a is None:
+            row['status'] = 'not measurable'
+        else:
+            q = adsk.core.Point3D.create(b[0], b[1], b[2])
+            q.transformBy(matrix)
+            want = (q.x, q.y, q.z)
+            err = max(abs(a[i] - want[i]) for i in range(3)) * CM
+            asked = max(abs(want[i] - b[i]) for i in range(3)) * CM
+            row['error_mm'] = round(err, 5)
+            row['asked_mm'] = round(asked, 4)
+            row['status'] = 'ok' if err < 1.0e-3 else (
+                'DID NOT MOVE' if err > asked * 0.5 else 'moved wrongly')
+        checks.append(row)
+    return notes, checks
 
 
 # --------------------------------------------------------------------------- #
@@ -354,8 +526,9 @@ def register(app, fixed, moving, along, o, step=None):
     if o.get('apply', True):
         say('Applying the transform')
         matrix = matrix_from(res['matrix'])
-        moved = apply_transform(des, [moving] + list(along), matrix)
-        res['applied'] = moved
+        notes, checks = apply_transform(des, [moving] + list(along), matrix)
+        res['applied'] = notes
+        res['checks'] = checks
     else:
         res['applied'] = []
     res['fixed'] = entity_label(fixed)
@@ -398,12 +571,29 @@ def format_report(res):
              'spacing' % res['sampling_floor_mm'])
     L.append('  of the fixed point cloud, and a perfect alignment still reports it.')
     L.append('')
-    if res.get('applied'):
+    if res.get('applied') or res.get('checks'):
         L.append('APPLIED')
-        for m in res['applied']:
+        for m in res.get('applied', []):
             L.append('  %s' % m)
-        if res.get('along'):
-            L.append('  moved along: %s' % ', '.join(res['along']))
+        bad = [c for c in res.get('checks', []) if c.get('status') != 'ok']
+        L.append('')
+        L.append('  every entity checked where it actually ended up:')
+        for c in res.get('checks', []):
+            if 'error_mm' in c:
+                L.append('    %-28s %-10s %s (off by %.5f mm)'
+                         % (c['entity'][:28], c['kind'], c['status'],
+                            c['error_mm']))
+            else:
+                L.append('    %-28s %-10s %s'
+                         % (c['entity'][:28], c['kind'], c['status']))
+        if bad:
+            L.append('')
+            L.append('  *** %d entit%s did not end up where the transform says.'
+                     % (len(bad), 'y' if len(bad) == 1 else 'ies'))
+            L.append('  Construction geometry cannot be moved by a move feature '
+                     'in a parametric')
+            L.append('  design; it follows whatever defines it. For anything '
+                     'else, undo and report this.')
     else:
         L.append('NOT APPLIED - the transform was computed only.')
     L.append('')
@@ -434,19 +624,25 @@ def on_created(app, cmd):
     cmd.isRepeatable = False
     inputs = cmd.commandInputs
 
+    # Mesh, solid and surface on BOTH sides, and freely mixed: the registration
+    # reads everything as triangles, so a mesh may be fixed and a solid moving.
     for cid, name, prompt in (
-            ('selFixed', 'Fixed entity', 'The body to stay where it is'),
-            ('selMoving', 'Moving entity', 'The body to be aligned onto it')):
+            ('selFixed', 'Fixed entity', 'The body to stay where it is - mesh '
+                                         'or solid'),
+            ('selMoving', 'Moving entity', 'The body to be aligned onto it - '
+                                           'mesh or solid')):
         si = inputs.addSelectionInput(cid, name, prompt)
-        si.addSelectionFilter('SolidBodies')
-        si.addSelectionFilter('MeshBodies')
-        si.addSelectionFilter('SurfaceBodies')
+        for f in ('SolidBodies', 'MeshBodies', 'SurfaceBodies'):
+            si.addSelectionFilter(f)
         si.setSelectionLimits(0, 1)
 
     sa = inputs.addSelectionInput('selAlong', 'Move along',
                                   'Anything that must travel with the moving '
-                                  'entity - plates, guides, components')
-    for f in ('SolidBodies', 'MeshBodies', 'SurfaceBodies', 'Occurrences'):
+                                  'entity - plates, guides, sketches, whole '
+                                  'components')
+    for f in ('SolidBodies', 'MeshBodies', 'SurfaceBodies', 'Occurrences',
+              'Sketches', 'ConstructionPlanes', 'ConstructionLines',
+              'ConstructionPoints'):
         sa.addSelectionFilter(f)
     sa.setSelectionLimits(0, 0)
 
@@ -505,6 +701,14 @@ def refresh(inputs):
                           'principal axes are tried in all four orientations, '
                           'and the best of them is refined by ICP. The report '
                           'gives the deviation before and after.'))
+        con = [a for a in al if _kind(a) == 'other'
+               and 'Construction' in a.objectType]
+        if con:
+            pairs.append(('', '<b>Construction geometry cannot be moved by a '
+                              'move feature in a parametric design.</b> It is '
+                              'defined by what it references and follows that. '
+                              'The report will say so per entity rather than '
+                              'claim it moved.'))
     inputs.itemById('info').formattedText = _rows(pairs)
 
 
@@ -676,7 +880,208 @@ def dev_register(app, job):
     return res
 
 
+def dev_cleanup_probes(app, job):
+    """Remove anything the probes left behind, by name."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.rootComponent
+    # Names first, then delete one at a time and look the next one up again:
+    # deleting a body invalidates every other proxy held from the collection, and
+    # even reading .name off one afterwards raises "refers to a deleted Object".
+    names = []
+    for b in list(comp.bRepBodies) + list(comp.meshBodies):
+        if b.name.startswith('probe_') or b.name.startswith('grtest_'):
+            names.append(b.name)
+    removed = []
+    for nm in names:
+        done = False
+        for coll in (comp.bRepBodies, comp.meshBodies):
+            # MeshBodies has no itemByName, so scan; the list is short
+            b = None
+            for cand in coll:
+                if cand.name == nm:
+                    b = cand
+                    break
+            if b:
+                try:
+                    b.deleteMe()
+                    removed.append(nm)
+                except Exception:
+                    removed.append('%s FAILED' % nm)
+                done = True
+                break
+        if not done:
+            removed.append('%s already gone' % nm)
+    sketches = []
+    for sk in comp.sketches:
+        try:
+            bb = sk.boundingBox
+            if bb and 29.0 < bb.minPoint.x < 31.0 and abs(bb.minPoint.y) < 1.0:
+                sketches.append(sk.name)
+                sk.deleteMe()
+        except Exception:
+            pass
+    return {'bodies_removed': removed, 'sketches_removed': sketches}
+
+
+def dev_verify_apply(app, job):
+    """Drive the REAL apply_transform over every kind of entity at once.
+
+    The bug was a mixed ObjectCollection silently moving only part of what it was
+    given, so the test that matters is the production path over a mesh, an
+    ordinary solid and a base-feature solid TOGETHER, with a transform that both
+    rotates and translates. Everything is scratch and is deleted afterwards.
+    """
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.rootComponent
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    made = []
+    sk = None
+    try:
+        # an ordinary parametric solid
+        sk = comp.sketches.add(comp.xYConstructionPlane)
+        sk.sketchCurves.sketchLines.addTwoPointRectangle(
+            adsk.core.Point3D.create(60.0, 0.0, 0.0),
+            adsk.core.Point3D.create(63.0, 3.0, 0.0))
+        ei = comp.features.extrudeFeatures.createInput(
+            sk.profiles.item(0),
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal(2.0))
+        ordinary = comp.features.extrudeFeatures.add(ei).bodies.item(0)
+        ordinary.name = 'grtest_solid_ordinary'
+
+        # a solid inside a base feature, as Mesh to Part produces
+        obb = adsk.core.OrientedBoundingBox3D.create(
+            adsk.core.Point3D.create(68.0, 0.0, 0.0),
+            adsk.core.Vector3D.create(1, 0, 0),
+            adsk.core.Vector3D.create(0, 1, 0), 2.0, 2.0, 2.0)
+        bf = comp.features.baseFeatures.add()
+        bf.startEdit()
+        try:
+            inbase = comp.bRepBodies.add(tbm.createBox(obb), bf)
+        finally:
+            bf.finishEdit()
+        inbase.name = 'grtest_solid_inbase'
+        made.append(bf)
+
+        # a mesh body
+        co = [76.0, 0, 0, 78.0, 0, 0, 76.0, 2.0, 0, 76.0, 0, 2.0]
+        idx = [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3]
+        bf2 = comp.features.baseFeatures.add()
+        bf2.startEdit()
+        try:
+            mesh = comp.meshBodies.addByTriangleMeshData(co, idx, [], [])
+        finally:
+            bf2.finishEdit()
+        mesh.name = 'grtest_mesh'
+        made.append(bf2)
+
+        # a transform that rotates as well as translates, so a probe point based
+        # on a bounding box centre would be caught out
+        m = adsk.core.Matrix3D.create()
+        m.setWithCoordinateSystem(
+            adsk.core.Point3D.create(1.0, -2.0, 3.0),
+            adsk.core.Vector3D.create(0.0, 1.0, 0.0),
+            adsk.core.Vector3D.create(-1.0, 0.0, 0.0),
+            adsk.core.Vector3D.create(0.0, 0.0, 1.0))
+
+        notes, checks = apply_transform(des, [mesh, ordinary, inbase], m)
+        return {'notes': notes, 'checks': checks,
+                'all_ok': all(c.get('status') == 'ok' for c in checks)}
+    finally:
+        for b in list(comp.bRepBodies) + list(comp.meshBodies):
+            if b.name.startswith('grtest_'):
+                try:
+                    b.deleteMe()
+                except Exception:
+                    pass
+        for f in reversed(made):
+            try:
+                f.deleteMe()
+            except Exception:
+                pass
+        try:
+            if sk:
+                sk.deleteMe()
+        except Exception:
+            pass
+
+
+def dev_inspect(app, job):
+    """Everything about a body that could stop a move feature acting on it."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    b = find_body(des, job['body'])
+    out = {'name': b.name, 'objectType': b.objectType}
+    for attr in ('isSolid', 'isValid', 'isVisible', 'isSelectable'):
+        try:
+            out[attr] = getattr(b, attr)
+        except Exception:
+            out[attr] = 'n/a'
+    try:
+        out['parentComponent'] = b.parentComponent.name
+    except Exception:
+        out['parentComponent'] = 'n/a'
+    try:
+        occ = b.assemblyContext
+        out['assemblyContext'] = occ.name if occ else None
+    except Exception:
+        out['assemblyContext'] = 'n/a'
+    try:
+        bf = b.baseFeature
+        out['baseFeature'] = bf.name if bf else None
+    except Exception:
+        out['baseFeature'] = 'n/a'
+    try:
+        out['nativeObject_is_self'] = (b.nativeObject is None
+                                       or b.nativeObject == b)
+    except Exception:
+        out['nativeObject_is_self'] = 'n/a'
+
+    try:
+        bb = b.boundingBox
+        out['bbox_mm'] = {'min': [bb.minPoint.x * CM, bb.minPoint.y * CM,
+                                  bb.minPoint.z * CM],
+                          'max': [bb.maxPoint.x * CM, bb.maxPoint.y * CM,
+                                  bb.maxPoint.z * CM]}
+    except Exception:
+        out['bbox_mm'] = 'n/a'
+    pp = probe_point(b)
+    out['probe_mm'] = [v * CM for v in pp] if pp else None
+
+    tl = des.timeline
+    out['timeline'] = {'count': tl.count, 'marker': tl.markerPosition}
+    tail = []
+    for i in range(max(0, tl.count - 8), tl.count):
+        it = tl.item(i)
+        try:
+            ent = it.entity
+            tail.append({'i': i, 'name': it.name,
+                         'type': ent.objectType.split('::')[-1] if ent else '?',
+                         'suppressed': it.isSuppressed,
+                         'healthState': str(it.healthState)})
+        except Exception:
+            tail.append({'i': i, 'name': it.name, 'type': '?'})
+    out['timeline']['tail'] = tail
+
+    # which timeline item produced this body
+    try:
+        for i in range(tl.count):
+            it = tl.item(i)
+            ent = it.entity
+            for coll in ('bodies',):
+                bs = getattr(ent, coll, None)
+                if bs:
+                    for k in range(bs.count):
+                        if bs.item(k).entityToken == b.entityToken:
+                            out['created_by'] = {'i': i, 'name': it.name}
+    except Exception:
+        pass
+    return out
+
+
 DEV_COMMANDS = {
     'ping': dev_ping,
     'register': dev_register,
+    'cleanup_probes': dev_cleanup_probes,
+    'verify_apply': dev_verify_apply,
+    'inspect': dev_inspect,
 }
