@@ -78,6 +78,7 @@ four seeds scored 0.29, 5.43, 9.92 and 9.69 mm, so the choice was not close.
 | **Reject pairs beyond** | absolute distance cut, 0 for none |
 | **Converged when rms changes less than** | |
 | **Apply the transform** | off computes and reports without moving anything |
+| **Keep the originals where they are** | duplicate first, move the copies |
 
 **Point-to-plane is the default** because point-to-point ICP slides to a halt on a
 smooth surface: every correspondence pulls towards one specific sample point, and
@@ -112,6 +113,21 @@ put it in a component and move the occurrence.
 
 Occurrences are composed onto their own placement, because for an occurrence the
 placement *is* the transform.
+
+## Keeping the originals
+
+With the checkbox on, the moving entity and every move-along entity is duplicated
+before anything moves. **The copy is what moves** and takes `" (registered)"`;
+what you selected stays exactly where it was and takes `" (original)"`.
+
+That way round on purpose: anything already referencing the body you picked keeps
+referencing something that has not moved, and the aligned version arrives as new
+geometry rather than as a silent edit to old geometry.
+
+An occurrence is duplicated as a second instance of the same component, left at
+the old placement. Anything that refuses to copy is passed through and moved
+itself, with a note saying so — better than refusing the whole operation over one
+selection.
 
 ## Nothing is reported as moved until it has been measured
 
@@ -195,6 +211,11 @@ py -3.10 tools/gr.py register '{"fixed": "Bone CT", "moving": "Bone scan", "alon
 
 runs it inside a live Fusion through the dev bridge. Off by default — create a
 `devbridge.on` file next to the installed add-in.
+
+`tools/gr.py verify_keep` checks the checkbox above end to end: a mesh and a
+solid duplicated and transformed, then measured — the copies must land exactly and
+the originals must be at **zero** displacement, because a duplicate that quietly
+moved too would defeat the whole point.
 
 `tools/gr.py verify_apply` is the regression test for the part that offline tests
 cannot reach: it drives the real `apply_transform` over a mesh body, an ordinary

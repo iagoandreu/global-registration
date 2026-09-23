@@ -69,6 +69,7 @@ DEFAULTS = {
     'gcMode': 0,
     'metric': 0,
     'principalAxes': True,
+    'keepOriginals': False,
     'preview': False,
 }
 
@@ -373,6 +374,64 @@ def _kind(e):
     return 'other'
 
 
+ORIGINAL_SUFFIX = ' (original)'
+REGISTERED_SUFFIX = ' (registered)'
+
+
+def duplicate_for_registration(design, entities):
+    """Copy each entity, so the registration can move the copy and leave the
+    original where it is.
+
+    The copy is what MOVES and takes " (registered)"; the entity you selected
+    stays put and takes " (original)". That way anything already referencing the
+    thing you selected keeps referencing something that has not moved, and the
+    aligned version arrives as new geometry rather than as a silent edit to old
+    geometry.
+
+    Returns (to_move, notes). Entities that cannot be copied are passed through
+    unchanged and moved directly, with a note saying so - which is better than
+    refusing the whole operation over one selection.
+    """
+    to_move = []
+    notes = []
+    for e in entities:
+        occ = adsk.fusion.Occurrence.cast(e)
+        base_name = entity_label(e)
+        try:
+            if occ:
+                # a second instance of the same component, left at the old place
+                comp = occ.sourceComponent if hasattr(occ, 'sourceComponent') \
+                    else design.rootComponent
+                keeper = comp.occurrences.addExistingComponent(
+                    occ.component, occ.transform2)
+                _rename(keeper, base_name + ORIGINAL_SUFFIX)
+                _rename(occ, base_name + REGISTERED_SUFFIX)
+                to_move.append(occ)
+                notes.append('%s duplicated; the copy keeps the old place'
+                             % base_name)
+                continue
+            copy = e.copyToComponent(e.parentComponent)
+            if copy is None:
+                raise RuntimeError('copyToComponent returned nothing')
+            _rename(e, base_name + ORIGINAL_SUFFIX)
+            _rename(copy, base_name + REGISTERED_SUFFIX)
+            to_move.append(copy)
+            notes.append('%s duplicated' % base_name)
+        except Exception:
+            to_move.append(e)
+            notes.append('%s could NOT be duplicated (%s) - it is being moved '
+                         'itself' % (base_name,
+                                     short_error(traceback.format_exc())))
+    return to_move, notes
+
+
+def _rename(e, name):
+    try:
+        e.name = name
+    except Exception:
+        pass
+
+
 def apply_transform(design, entities, matrix):
     """Move everything by one matrix, in as few features as the API allows.
 
@@ -524,9 +583,14 @@ def register(app, fixed, moving, along, o, step=None):
     res = run_engine(fx, mv, params_from(o))
 
     if o.get('apply', True):
-        say('Applying the transform')
         matrix = matrix_from(res['matrix'])
-        notes, checks = apply_transform(des, [moving] + list(along), matrix)
+        targets = [moving] + list(along)
+        if o.get('keep_originals'):
+            say('Duplicating, so the originals can stay where they are')
+            targets, dup_notes = duplicate_for_registration(des, targets)
+            res['duplicated'] = dup_notes
+        say('Applying the transform')
+        notes, checks = apply_transform(des, targets, matrix)
         res['applied'] = notes
         res['checks'] = checks
     else:
@@ -571,6 +635,13 @@ def format_report(res):
              'spacing' % res['sampling_floor_mm'])
     L.append('  of the fixed point cloud, and a perfect alignment still reports it.')
     L.append('')
+    if res.get('duplicated'):
+        L.append('DUPLICATED - the originals keep their place')
+        for m in res['duplicated']:
+            L.append('  %s' % m)
+        L.append('  what moved is named "%s"; what stayed is "%s"'
+                 % (REGISTERED_SUFFIX.strip(), ORIGINAL_SUFFIX.strip()))
+        L.append('')
     if res.get('applied') or res.get('checks'):
         L.append('APPLIED')
         for m in res.get('applied', []):
@@ -675,6 +746,8 @@ def on_created(app, cmd):
                          float(s['tolerance']) * MM))
 
     inputs.addBoolValueInput('applyIt', 'Apply the transform', True, '', True)
+    inputs.addBoolValueInput('keepOriginals', 'Keep the originals where they are',
+                             True, '', bool(s.get('keepOriginals', False)))
 
     info = inputs.addTextBoxCommandInput('info', '', '', 10, True)
     info.isFullWidth = True
@@ -682,6 +755,7 @@ def on_created(app, cmd):
 
 
 def refresh(inputs):
+    inputs.itemById('keepOriginals').isVisible = inputs.itemById('applyIt').value
     fx = selected(inputs.itemById('selFixed'))
     mv = selected(inputs.itemById('selMoving'))
     al = selected(inputs.itemById('selAlong'))
@@ -734,6 +808,7 @@ def options_from(inputs):
         'metric': METRICS[inputs.itemById('metric').selectedItem.index][0],
         'principal_axes': inputs.itemById('principalAxes').value,
         'apply': inputs.itemById('applyIt').value,
+        'keep_originals': inputs.itemById('keepOriginals').value,
     }
 
 
@@ -748,6 +823,7 @@ def settings_from(inputs):
         'gcMode': inputs.itemById('gcMode').selectedItem.index,
         'metric': inputs.itemById('metric').selectedItem.index,
         'principalAxes': inputs.itemById('principalAxes').value,
+        'keepOriginals': inputs.itemById('keepOriginals').value,
     }
 
 
@@ -874,7 +950,8 @@ def dev_register(app, job):
          'gc': job.get('gc', 'auto'),
          'metric': job.get('metric', 'plane'),
          'principal_axes': job.get('principal_axes', True),
-         'apply': job.get('apply', True)}
+         'apply': job.get('apply', True),
+         'keep_originals': job.get('keep_originals', False)}
     res = register(app, fixed, moving, along, o)
     res['text'] = format_report(res)
     return res
@@ -889,7 +966,7 @@ def dev_cleanup_probes(app, job):
     # even reading .name off one afterwards raises "refers to a deleted Object".
     names = []
     for b in list(comp.bRepBodies) + list(comp.meshBodies):
-        if b.name.startswith('probe_') or b.name.startswith('grtest_'):
+        if b.name.startswith(('probe_', 'grtest_', 'grkeep_')):
             names.append(b.name)
     removed = []
     for nm in names:
@@ -906,7 +983,17 @@ def dev_cleanup_probes(app, job):
                     b.deleteMe()
                     removed.append(nm)
                 except Exception:
-                    removed.append('%s FAILED' % nm)
+                    # a body copied into a base feature sometimes refuses to go
+                    # on its own; taking the base feature takes the body with it
+                    gone = False
+                    try:
+                        bf = getattr(b, 'baseFeature', None)
+                        if bf:
+                            bf.deleteMe()
+                            gone = True
+                    except Exception:
+                        pass
+                    removed.append(nm if gone else '%s FAILED' % nm)
                 done = True
                 break
         if not done:
@@ -1078,10 +1165,134 @@ def dev_inspect(app, job):
     return out
 
 
+def dev_export(app, job):
+    """Write a body's triangles to a JSON file. Mesh or solid, either way."""
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    b = find_body(des, job['body'])
+    co, idx = body_mesh(b)
+    path = job['path']
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump({'name': b.name, 'coords': co, 'idx': idx}, fh)
+    return {'body': b.name, 'path': path, 'tri': len(idx) // 3,
+            'nodes': len(co) // 3}
+
+
+def dev_verify_keep(app, job):
+    """Keep-the-originals, end to end: the copies move, the originals do not.
+
+    A mesh body and a solid, duplicated and then transformed through the real
+    apply_transform with a matrix that rotates as well as translates. Checks the
+    naming and, more to the point, that the entity left behind is still exactly
+    where it was - a duplicate that quietly moved too would defeat the whole
+    purpose of the checkbox.
+    """
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.rootComponent
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    made = []
+    sk = None
+    checks = []
+    try:
+        sk = comp.sketches.add(comp.xYConstructionPlane)
+        sk.sketchCurves.sketchLines.addTwoPointRectangle(
+            adsk.core.Point3D.create(90.0, 0.0, 0.0),
+            adsk.core.Point3D.create(93.0, 3.0, 0.0))
+        ei = comp.features.extrudeFeatures.createInput(
+            sk.profiles.item(0),
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal(2.0))
+        solid = comp.features.extrudeFeatures.add(ei).bodies.item(0)
+        solid.name = 'grkeep_solid'
+
+        co = [100.0, 0, 0, 102.0, 0, 0, 100.0, 2.0, 0, 100.0, 0, 2.0]
+        idx = [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3]
+        bf = comp.features.baseFeatures.add()
+        bf.startEdit()
+        try:
+            mesh = comp.meshBodies.addByTriangleMeshData(co, idx, [], [])
+        finally:
+            bf.finishEdit()
+        mesh.name = 'grkeep_mesh'
+        made.append(bf)
+
+        where_before = {'grkeep_solid': probe_point(solid),
+                        'grkeep_mesh': probe_point(mesh)}
+
+        targets, dup_notes = duplicate_for_registration(des, [mesh, solid])
+
+        m = adsk.core.Matrix3D.create()
+        m.setWithCoordinateSystem(
+            adsk.core.Point3D.create(0.0, 0.0, 12.0),
+            adsk.core.Vector3D.create(0.0, 1.0, 0.0),
+            adsk.core.Vector3D.create(-1.0, 0.0, 0.0),
+            adsk.core.Vector3D.create(0.0, 0.0, 1.0))
+        notes, moved_checks = apply_transform(des, targets, m)
+        adsk.doEvents()
+
+        names = [b.name for b in list(comp.bRepBodies) + list(comp.meshBodies)
+                 if b.name.startswith('grkeep_')]
+        for stem in ('grkeep_solid', 'grkeep_mesh'):
+            for suffix, should_move in ((ORIGINAL_SUFFIX, False),
+                                        (REGISTERED_SUFFIX, True)):
+                want = stem + suffix
+                found = None
+                for coll in (comp.bRepBodies, comp.meshBodies):
+                    for cand in coll:
+                        if cand.name == want:
+                            found = cand
+                if found is None:
+                    checks.append({'name': want, 'status': 'MISSING'})
+                    continue
+                now = probe_point(found)
+                b0 = where_before[stem]
+                d = (max(abs(now[i] - b0[i]) for i in range(3)) * CM
+                     if (now and b0) else None)
+                if should_move:
+                    ok = d is not None and d > 1.0
+                    checks.append({'name': want, 'moved_mm': round(d or 0, 4),
+                                   'status': 'ok' if ok else 'SHOULD HAVE MOVED'})
+                else:
+                    ok = d is not None and d < 1.0e-6
+                    checks.append({'name': want, 'moved_mm': round(d or 0, 6),
+                                   'status': 'ok' if ok else 'MOVED BUT SHOULD NOT'})
+        return {'names_present': sorted(names), 'duplicated': dup_notes,
+                'applied': notes, 'moved_checks': moved_checks,
+                'checks': checks,
+                'all_ok': all(c['status'] == 'ok' for c in checks)}
+    finally:
+        for _pass in range(3):
+            for coll in (comp.bRepBodies, comp.meshBodies):
+                victims = [b.name for b in coll if b.name.startswith('grkeep_')]
+                for nm in victims:
+                    tgt = None
+                    for cand in coll:
+                        if cand.name == nm:
+                            tgt = cand
+                            break
+                    if tgt:
+                        try:
+                            tgt.deleteMe()
+                        except Exception:
+                            pass
+        for f in reversed(made):
+            try:
+                f.deleteMe()
+            except Exception:
+                pass
+        try:
+            if sk:
+                sk.deleteMe()
+        except Exception:
+            pass
+
+
 DEV_COMMANDS = {
     'ping': dev_ping,
     'register': dev_register,
     'cleanup_probes': dev_cleanup_probes,
     'verify_apply': dev_verify_apply,
+    'verify_keep': dev_verify_keep,
     'inspect': dev_inspect,
+    'export': dev_export,
 }
