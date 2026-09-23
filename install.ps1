@@ -12,6 +12,11 @@ if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Recurse -F
 foreach ($f in @('GlobalRegistration.py', 'gr_core.py', 'gr_engine.py', 'GlobalRegistration.manifest')) {
     Copy-Item -LiteralPath (Join-Path $src $f) -Destination $dst -Force
 }
+# Copy-Item -Recurse into a directory that ALREADY holds one of the same name
+# nests it (resources/Wrap/Wrap) instead of merging, and the old icons then stay
+# where Fusion is looking. Clear the destination first so the copy is a replace.
+$resDst = Join-Path $dst 'resources'
+if (Test-Path -LiteralPath $resDst) { Remove-Item -LiteralPath $resDst -Recurse -Force }
 Copy-Item -LiteralPath (Join-Path $src 'resources') -Destination $dst -Recurse -Force
 
 # the dev bridge is opt-in: the marker file is only copied if it exists here
