@@ -4,13 +4,162 @@ A Fusion 360 add-in that aligns one body onto another **by shape alone** — no
 landmarks, no common coordinate system — and carries any number of *move along*
 entities with it on the same transform.
 
-The 3-matic Global Registration workflow, in Fusion. Built for the case where a
+Registration by shape alone, in Fusion. Built for the case where a
 scan, a segmentation and a design have drifted into different coordinate systems
 and the plate has to stay where it was put relative to the bone.
 
 **Mesh bodies and solids are interchangeable.** Fixed and moving may be one of
 each; both are read as triangles, a mesh body directly and a solid by
 tessellation.
+
+## How to use
+
+### Where the button is
+
+**Design** workspace: **Solid** tab, **Modify** panel, and **Mesh** tab,
+**Modify** panel. The button is **Global Registration**. It is not promoted, so
+open the **Modify** drop-down to find it.
+
+### Before you start
+
+- **Two bodies of the same anatomy** in one design: the **fixed** one stays where
+  it is, the **moving** one is aligned onto it. Each may be a mesh body, a solid
+  or a surface body, in any combination. Typical pairs: a segmentation STL and the
+  bone it should sit on, or a scan and a planned model.
+- **Anything that must keep its position relative to the moving body** (plate,
+  guide, screws, sketches, a whole component) can be carried along.
+- **An external Python 3 with numpy and scipy.** Fusion's own Python has neither,
+  so the registration runs in a separate process:
+
+  ```
+  pip install numpy scipy
+  ```
+
+  The add-in takes the first interpreter in this list that can import numpy and
+  scipy:
+
+  1. the `GLOBALREG_PYTHON` environment variable (full path to `python.exe`);
+     if it is not set, `MESHTOPART_PYTHON` is used instead;
+  2. a file `python_path.txt` beside the installed add-in
+     (`%APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns\GlobalRegistration\python_path.txt`)
+     holding that full path on one line;
+  3. `%LOCALAPPDATA%\Programs\Python\Python313\python.exe`, then `Python312`,
+     `Python311`, `Python310`, `Python39`;
+  4. `py -3.10`;
+  5. `python` on the PATH.
+
+  If none works, **Register** stops with a message telling you to set
+  `GLOBALREG_PYTHON` or `python_path.txt`.
+
+### Step by step
+
+1. Click **Global Registration**. The OK button is labelled **Register**.
+2. **Fixed entity**: select the body that stays where it is (one body).
+3. **Moving entity**: select the body to be aligned onto it (one body). It must be
+   a different body from the fixed one.
+4. **Move along** (optional): select everything that must travel with the moving
+   body. Allowed: solid, mesh and surface bodies, components, sketches,
+   construction planes, axes and points. Any number.
+5. Read the text box at the bottom: it repeats what you selected and warns if
+   you picked construction geometry (see Known limits).
+6. Check the settings below. For a first run the defaults are a good start.
+7. Click **Register**. A progress bar runs, then the report opens.
+
+The settings are saved (`last_settings.json` beside the installed add-in) and
+come back next time, except **Apply the transform**, which is always on when the
+dialog opens. The defaults below are the first-run values.
+
+**Initial alignment**
+
+| Input | Default | What it does |
+|---|---|---|
+| Centre of gravity | Volume if closed, else surface | Which centre is matched first: *Volume if closed, else surface*, *Volume centroid*, or *Surface (area-weighted) centroid*. |
+| Also try the principal axes | on | Tries the four orientations of the principal axes and keeps the best. Turn it off to only refine from where the moving body is now. |
+
+**Registration**
+
+| Input | Default | What it does |
+|---|---|---|
+| Metric | Point to plane (faster, default) | *Point to plane* or *Point to point*. Point to plane lets smooth surfaces slide onto each other. |
+| Max iterations | 60 (1 to 500) | ICP iteration cap. |
+| Sample points (moving) | 40 000 | How many points of the moving body are fitted. |
+| Sample points (fixed) | 120 000 | How densely the fixed surface is sampled. This sets the point-to-point floor in the report. |
+| Overlap used | 100 (5 to 100, in %) | Keep only the best this-many percent of point pairs each iteration. Lower it when the moving body covers only part of the fixed one. |
+| Reject pairs beyond (0 = no limit) | 0 mm | Ignore point pairs farther apart than this. |
+| Converged when rms changes less than | 0.0001 mm | Stop when the RMS improves by less than this between iterations. |
+
+**Result**
+
+| Input | Default | What it does |
+|---|---|---|
+| Apply the transform | on | Off computes the transform and shows the report without moving anything. |
+| Keep the originals where they are | off | Shown when the transform is applied. Duplicates the moving body and every move-along entity first; the copies move, the originals stay. |
+
+### What you get
+
+- The moving body and every move-along entity are moved by one rigid transform.
+  In the timeline this is one **Move** feature per component and per body type
+  (mesh, solid), and a separate one for solids inside a base feature. Components
+  are moved by changing their position.
+- With **Keep the originals where they are**: the moved copies are named
+  **`<name> (registered)`** and the bodies you selected are renamed
+  **`<name> (original)`** and stay in place. A component is kept as a second
+  instance of the same component at the old place.
+- With **Apply the transform** off: nothing in the design changes.
+- The report opens in a message box and is appended to `GlobalRegistration.log`
+  beside the installed add-in. No separate report file is written.
+
+### Checking the result
+
+The report has these parts:
+
+- **CENTRE OF GRAVITY**: which centroid type was used for each body, and where.
+- **REGISTRATION**: the seed (which principal-axis orientation won), iterations,
+  points used, and the transform as a rotation in degrees and a translation in mm.
+- **DEVIATION, moving surface to fixed surface**: RMS, p95 and max in mm, before
+  and after. Then the same **after** numbers measured to the tangent plane, and the
+  **point-to-point floor**: half the spacing of the fixed point cloud, which even a
+  perfect alignment reports.
+- **APPLIED**: one line per entity, measured after the move: `ok (off by ... mm)`,
+  `DID NOT MOVE`, `moved wrongly` or `not measurable`. A line starting with `***`
+  means at least one entity did not end up where the transform says.
+
+Before you trust it:
+
+1. Read the **tangent-plane** RMS, not only the point-to-point RMS. If the
+   point-to-point RMS is close to the floor, the remaining difference is sampling,
+   not misalignment.
+2. Check that every line under **APPLIED** says `ok`. If one does not, undo
+   (Ctrl+Z) and check that entity.
+3. Look at the result in Fusion. A near-symmetric bone can align in a plausible but
+   wrong orientation; the numbers alone will not always show that. Section views
+   are a quick check.
+4. If the bodies only partly overlap and the result looks off, lower
+   **Overlap used** (for example to 60) and run again.
+
+### Where it fits in a patient-specific workflow
+
+Use it when the anatomy and the design are in different coordinate systems, for
+example a new segmentation, a scan of a printed model, or a mesh exported from
+another program. Register it onto the reference bone and carry the plate, guide
+and screw trajectories along, so they keep their position relative to the bone.
+It usually comes right after importing the segmentation STL, before Mesh to Part
+and the guide or plate design.
+
+### Known limits
+
+- **Construction geometry cannot be moved** by a move feature in a parametric
+  design. It follows whatever defines it. The report lists it as not moved. To
+  carry it along, put it in a component and select the component.
+- Registration is by shape only. Two bodies that do not share a surface (for
+  example a bone and a plate) will not register meaningfully.
+- A solid is read through its display mesh, or tessellated at about 1/2000 of its
+  bounding-box diagonal if it has no display mesh, so the solid's own
+  tessellation limits how exact the result can be.
+- The registration runs in a separate process with a 30-minute limit. Very large
+  meshes are sampled, not used in full (see the two **Sample points** inputs).
+- Undo with Ctrl+Z. The move features stay in the timeline and can be deleted or
+  suppressed like any other feature.
 
 ## Measured
 
